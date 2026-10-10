@@ -1,0 +1,87 @@
+name: ailang_ci
+
+on:
+    repository_dispatch:
+        types:
+            - ailang_ci
+    workflow_dispatch:
+        inputs:
+            ref:
+                description: "branch, tag, or SHA to test"
+                required: true
+                default: "main"
+                type: string
+
+permissions:
+    contents: read
+
+# 同一目标（SHA/ref）的重复触发只保留最新一轮
+concurrency:
+    group: ailang-ci-${{ github.event.client_payload.sha || inputs.ref }}
+    cancel-in-progress: true
+
+jobs:
+    build_and_test:
+        name: build_and_test (${{ matrix.platform }})
+        runs-on: ${{ matrix.os }}
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    # 三平台并行、相互独立：任一平台失败不影响其它平台给出结果
+                    - os: ubuntu-latest
+                      platform: linux
+                      cc: gcc
+                      generator: Ninja
+                    - os: macos-latest
+                      platform: macos
+                      cc: clang
+                      generator: Unix Makefiles
+                    # MSVC：不指定生成器（windows-latest 镜像的 VS 版本随时代演进，
+                    # 硬编码 "Visual Studio 17 2022" 之类会在镜像升级后失效）
+                    - os: windows-latest
+                      platform: windows
+                      cc: ""
+                      generator: ""
+        steps:
+            - name: checkout_source
+              uses: actions/checkout@v5
+              with:
+                  repository: ${{ secrets.SOURCE_REPO }}
+                  ssh-key: ${{ secrets.AILANG_DEPLOY_KEY }}
+                  ref: ${{ github.event.client_payload.sha || inputs.ref }}
+
+            - name: configure
+              shell: bash
+              run: |
+                  # 非零 cc 时导出为 CC（Windows/MSVC 用 CMake 默认探测，不导出）
+                  if [[ -n "${{ matrix.cc }}" ]]; then
+                      export CC="${{ matrix.cc }}"
+                  fi
+                  if [[ "${RUNNER_OS}" == "Windows" ]]; then
+                      # VS 多配置生成器：不指定 -G（自动探测镜像上的 VS 实例），
+                      # Debug/Release 由 --config 指定，不设 CMAKE_BUILD_TYPE
+                      cmake -S . -B out/build
+                  else
+                      # Debug（-O0），与 CMakePresets 的 default 预设一致
+                      cmake -S . -B out/build -G "${{ matrix.generator }}" -DCMAKE_BUILD_TYPE=Debug
+                  fi
+
+            - name: build
+              shell: bash
+              run: |
+                  if [[ "${RUNNER_OS}" == "Windows" ]]; then
+                      cmake --build out/build --config Debug
+                  else
+                      cmake --build out/build
+                  fi
+
+            - name: test
+              shell: bash
+              run: |
+                  # 全量 ctest；单测超时上限 600s
+                  if [[ "${RUNNER_OS}" == "Windows" ]]; then
+                      ctest --test-dir out/build -C Debug --output-on-failure --timeout 600
+                  else
+                      ctest --test-dir out/build --output-on-failure --timeout 600
+                  fi
